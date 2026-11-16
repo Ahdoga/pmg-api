@@ -1412,6 +1412,18 @@ sub postmap_pmg_transport {
 
 PVE::JSONSchema::register_format('transport-address', \&pmg_verify_transport_address);
 
+PVE::JSONSchema::register_format(
+    'transport-address-or-empty',
+    \&pmg_verify_transport_address_or_empty,
+);
+
+sub pmg_verify_transport_address_or_empty {
+    my ($name, $noerr) = @_;
+
+    return $name if !defined($name) || $name eq '';
+    return pmg_verify_transport_address($name, $noerr);
+}
+
 sub pmg_verify_transport_address {
     my ($name, $noerr) = @_;
 
@@ -1448,35 +1460,64 @@ sub read_transport_map {
             $comment = '';
         };
 
-        if ($line =~ m/^(\S+)\s+(?:(lmtp):inet|(smtp)):(\S+):(\d+)\s*$/) {
-            my ($domain, $protocol, $host, $port) = ($1, ($2 or $3), $4, $5);
+        if ($line =~ m/^(\S+)\s+(?:(lmtp):inet|(smtp)):(.+?)\s*$/) {
+            my ($domain, $protocol, $dests) = ($1, ($2 or $3), $4);
 
             eval { pmg_verify_transport_domain_or_email($domain); };
             if (my $err = $@) {
                 $parse_error->($err);
                 next;
             }
-            my $use_mx = 1;
-            if ($host =~ m/^\[(.*)\]$/) {
-                $host = $1;
-                $use_mx = 0;
-            }
-            $use_mx = 0 if ($protocol eq "lmtp");
 
-            eval { pmg_verify_transport_address($host); };
-            if (my $err = $@) {
-                $parse_error->($err);
+            # postfix (>= 3.5) accepts a comma separated list of destinations for smtp
+            # transports and tries them in order. The first one is the primary destination,
+            # an optional second one is the backup (failover) destination.
+            my @dests = split(/\s*,\s*/, $dests);
+            if (scalar(@dests) > 2 || ($protocol eq 'lmtp' && scalar(@dests) > 1)) {
+                $parse_error->('unsupported number of destinations');
+                next;
+            }
+
+            my @parsed;
+            my $dest_err;
+            foreach my $dest (@dests) {
+                if ($dest !~ m/^(\S+):(\d+)$/) {
+                    $dest_err = 'wrong format';
+                    last;
+                }
+                my ($host, $port) = ($1, $2);
+                my $use_mx = 1;
+                if ($host =~ m/^\[(.*)\]$/) {
+                    $host = $1;
+                    $use_mx = 0;
+                }
+                $use_mx = 0 if ($protocol eq "lmtp");
+
+                eval { pmg_verify_transport_address($host); };
+                if (my $err = $@) {
+                    $dest_err = $err;
+                    last;
+                }
+                push @parsed, { host => $host, port => $port, use_mx => $use_mx };
+            }
+            if (defined($dest_err) || !scalar(@parsed)) {
+                $parse_error->($dest_err // 'wrong format');
                 next;
             }
 
             my $data = {
                 domain => $domain,
                 protocol => $protocol,
-                host => $host,
-                port => $port,
-                use_mx => $use_mx,
+                host => $parsed[0]->{host},
+                port => $parsed[0]->{port},
+                use_mx => $parsed[0]->{use_mx},
                 comment => $comment,
             };
+            if (my $backup = $parsed[1]) {
+                $data->{backup_host} = $backup->{host};
+                $data->{backup_port} = $backup->{port};
+                $data->{backup_use_mx} = $backup->{use_mx};
+            }
             $res->{$domain} = $data;
             $comment = '';
         } else {
@@ -1499,20 +1540,29 @@ sub write_transport_map {
         PVE::Tools::safe_print($filename, $fh, "#$comment\n")
             if defined($comment) && $comment !~ m/^\s*$/;
 
-        my $bracket_host = !$data->{use_mx};
+        my $protocol = $data->{protocol};
 
-        if ($data->{protocol} eq 'lmtp') {
-            $bracket_host = 0;
-            $data->{protocol} .= ":inet";
+        my $format_dest = sub {
+            my ($host, $port, $use_mx) = @_;
+
+            my $bracket_host = !$use_mx;
+            $bracket_host = 0 if $protocol eq 'lmtp';
+            $bracket_host = 1 if $host =~ m/^(?:$IPV4RE|(?:ipv6:)?$IPV6RE)$/i;
+            return ($bracket_host ? "[$host]" : $host) . ":$port";
+        };
+
+        my $dest = $format_dest->($data->{host}, $data->{port}, $data->{use_mx});
+
+        # optional backup destination (failover), only supported for smtp
+        if ($protocol eq 'smtp' && defined($data->{backup_host}) && $data->{backup_host} ne '') {
+            my $backup_port = $data->{backup_port} // $data->{port};
+            my $backup_use_mx = $data->{backup_use_mx} // $data->{use_mx};
+            $dest .= ", " . $format_dest->($data->{backup_host}, $backup_port, $backup_use_mx);
         }
-        $bracket_host = 1 if $data->{host} =~ m/^(?:$IPV4RE|(?:ipv6:)?$IPV6RE)$/i;
-        my $host = $bracket_host ? "[$data->{host}]" : $data->{host};
 
-        PVE::Tools::safe_print(
-            $filename,
-            $fh,
-            "$data->{domain} $data->{protocol}:$host:$data->{port}\n",
-        );
+        $protocol .= ":inet" if $protocol eq 'lmtp';
+
+        PVE::Tools::safe_print($filename, $fh, "$data->{domain} $protocol:$dest\n");
     }
 }
 
@@ -1565,13 +1615,14 @@ sub get_template_vars {
     if (my $tmap = PVE::INotify::read_file('transport')) {
         foreach my $domain (keys %$tmap) {
             my $data = $tmap->{$domain};
-            my $host = $data->{host};
-            if ($host =~ m/^$IPV4RE$/) {
-                $transportnets->{"$host/32"} = 1;
-                $mynetworks->{"$host/32"} = 1;
-            } elsif ($host =~ m/^(?:ipv6:)?($IPV6RE)$/i) {
-                $transportnets->{"[$1]/128"} = 1;
-                $mynetworks->{"[$1]/128"} = 1;
+            foreach my $host (grep { defined($_) } ($data->{host}, $data->{backup_host})) {
+                if ($host =~ m/^$IPV4RE$/) {
+                    $transportnets->{"$host/32"} = 1;
+                    $mynetworks->{"$host/32"} = 1;
+                } elsif ($host =~ m/^(?:ipv6:)?($IPV6RE)$/i) {
+                    $transportnets->{"[$1]/128"} = 1;
+                    $mynetworks->{"[$1]/128"} = 1;
+                }
             }
         }
     }

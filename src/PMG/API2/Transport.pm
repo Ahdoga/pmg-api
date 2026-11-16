@@ -36,6 +36,9 @@ __PACKAGE__->register_method({
                 protocol => { type => 'string' },
                 port => { type => 'integer' },
                 use_mx => { type => 'boolean' },
+                backup_host => { type => 'string', optional => 1 },
+                backup_port => { type => 'integer', optional => 1 },
+                backup_use_mx => { type => 'boolean', optional => 1 },
                 comment => { type => 'string' },
             },
         },
@@ -98,6 +101,27 @@ __PACKAGE__->register_method({
                 optional => 1,
                 default => 1,
             },
+            backup_host => {
+                description => "Backup target host (name or IP address). Postfix uses it if"
+                    . " the primary host cannot be reached. Only supported for the 'smtp'"
+                    . " protocol. Set to an empty string to remove it.",
+                type => 'string',
+                format => 'transport-address-or-empty',
+                optional => 1,
+            },
+            backup_port => {
+                description => "Backup transport port (defaults to the primary port).",
+                type => 'integer',
+                minimum => 1,
+                maximum => 65535,
+                optional => 1,
+            },
+            backup_use_mx => {
+                description => "Enable MX lookups for the backup host (defaults to the primary"
+                    . " setting).",
+                type => 'boolean',
+                optional => 1,
+            },
             comment => {
                 description => "Comment.",
                 type => 'string',
@@ -124,6 +148,15 @@ __PACKAGE__->register_method({
                 use_mx => $param->{use_mx} // 1,
                 comment => $param->{comment} // '',
             };
+
+            if (defined($param->{backup_host}) && $param->{backup_host} ne '') {
+                die "backup host is only supported for the smtp protocol\n"
+                    if $tmap->{ $param->{domain} }->{protocol} ne 'smtp';
+                my $entry = $tmap->{ $param->{domain} };
+                $entry->{backup_host} = $param->{backup_host};
+                $entry->{backup_port} = $param->{backup_port} // $entry->{port};
+                $entry->{backup_use_mx} = $param->{backup_use_mx} // $entry->{use_mx};
+            }
 
             PVE::INotify::write_file('transport', $tmap);
 
@@ -161,6 +194,9 @@ __PACKAGE__->register_method({
             protocol => { type => 'string' },
             port => { type => 'integer' },
             use_mx => { type => 'boolean' },
+            backup_host => { type => 'string', optional => 1 },
+            backup_port => { type => 'integer', optional => 1 },
+            backup_use_mx => { type => 'boolean', optional => 1 },
             comment => { type => 'string' },
         },
     },
@@ -218,6 +254,27 @@ __PACKAGE__->register_method({
                 type => 'boolean',
                 optional => 1,
             },
+            backup_host => {
+                description => "Backup target host (name or IP address). Postfix uses it if"
+                    . " the primary host cannot be reached. Only supported for the 'smtp'"
+                    . " protocol. Set to an empty string to remove it.",
+                type => 'string',
+                format => 'transport-address-or-empty',
+                optional => 1,
+            },
+            backup_port => {
+                description => "Backup transport port (defaults to the primary port).",
+                type => 'integer',
+                minimum => 1,
+                maximum => 65535,
+                optional => 1,
+            },
+            backup_use_mx => {
+                description => "Enable MX lookups for the backup host (defaults to the primary"
+                    . " setting).",
+                type => 'boolean',
+                optional => 1,
+            },
             comment => {
                 description => "Comment.",
                 type => 'string',
@@ -241,9 +298,18 @@ __PACKAGE__->register_method({
 
             die "no options specified\n" if !scalar(keys %$param);
 
-            for my $prop (qw(host protocol port use_mx comment)) {
+            my @props = qw(host protocol port use_mx comment backup_host backup_port backup_use_mx);
+            for my $prop (@props) {
                 $data->{$prop} = $param->{$prop} if defined($param->{$prop});
             }
+
+            # an empty backup host removes the backup destination
+            if (defined($param->{backup_host}) && $param->{backup_host} eq '') {
+                delete $data->{$_} for qw(backup_host backup_port backup_use_mx);
+            }
+
+            die "backup host is only supported for the smtp protocol\n"
+                if defined($data->{backup_host}) && $data->{protocol} ne 'smtp';
 
             PVE::INotify::write_file('transport', $tmap);
 
